@@ -1,147 +1,214 @@
 import os
 import numpy as np
 import librosa
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 import tqdm
 
 # --- FFMPEG CONFIGURATION ---
-# We use imageio-ffmpeg as the source of truth for the binary
 try:
     import imageio_ffmpeg
     os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
-    print(f"[FFMPEG] Using binary at: {os.environ['FFMPEG_BINARY']}")
 except ImportError:
-    print("[FFMPEG] imageio-ffmpeg not found. Re-installing...")
-    import subprocess
-    subprocess.check_call(["pip", "install", "imageio-ffmpeg"])
-    import imageio_ffmpeg
-    os.environ["FFMPEG_BINARY"] = imageio_ffmpeg.get_ffmpeg_exe()
+    os.environ["FFMPEG_BINARY"] = "ffmpeg"
 
-# Now safe to import MoviePy
 from moviepy.editor import VideoClip, AudioFileClip
 
 class ProVisualizer:
-    def __init__(self, audio_path, output_path, resolution=(1920, 1080), fps=60):
+    def __init__(self, audio_path, output_path, params=None):
         self.audio_path = audio_path
         self.output_path = output_path
-        self.width, self.height = resolution
-        self.fps = fps
-        self.duration = 0
         
-        # Audio Analysis storage
+        # Default Parameters
+        self.params = {
+            'resolution': (1920, 1080),
+            'fps': 60,
+            'color_a': "#00f2ff",
+            'color_b': "#7000ff",
+            'cycle_speed': 2.0,
+            'travel_speed': 15.0,
+            'rotation_force': 1.2,
+            'shake_force': 40.0,
+            'star_size': 10.0,
+            'logo_path': "",
+            'mark_path': ""
+        }
+        if params:
+            self.params.update(params)
+            
+        self.width, self.height = self.params['resolution']
+        self.fps = self.params['fps']
+        
+        # Internal State
+        self.duration = 0
         self.stft = None
         self.rms_energy = None
         self.sample_rate = 0
         
-        # Aesthetics Seed
-        self.seed = abs(hash(os.path.basename(audio_path)))
-        np.random.seed(self.seed % (2**32))
-        self.theme_color = (np.random.randint(0, 100), np.random.randint(150, 255), np.random.randint(200, 255))
+        # Assets
+        self.logo_img = self.load_asset(self.params['logo_path'])
+        self.mark_img = self.load_asset(self.params['mark_path'])
         
+        # Background Stars System
+        self.init_stars()
+        self.offset = 0
+        self.current_angle = 0
+        self.color_time = 0
+
+    def load_asset(self, path):
+        if path and os.path.exists(path):
+            try:
+                img = Image.open(path).convert("RGBA")
+                return img
+            except:
+                return None
+        return None
+
+    def init_stars(self):
+        self.stars = []
+        for _ in range(600):
+            self.stars.append({
+                'x': (np.random.random() - 0.5) * self.width * 3.5,
+                'y': (np.random.random() - 0.5) * self.height * 3.5,
+                'z': np.random.random() * self.width,
+                'brightness': 0.4 + np.random.random() * 0.6,
+                'pulse': np.random.random() * np.pi * 2,
+                'pulse_speed': 0.02 + np.random.random() * 0.05,
+                'is_nova': np.random.random() > 0.97
+            })
+
+    def hex_to_rgb(self, hex):
+        hex = hex.lstrip('#')
+        return tuple(int(hex[i:i+2], 16) for i in (0, 2, 4))
+
+    def lerp_color(self, c1, c2, t):
+        r = int(c1[0] + (c2[0] - c1[0]) * t)
+        g = int(c1[1] + (c2[1] - c1[1]) * t)
+        b = int(c1[2] + (c2[2] - c1[2]) * t)
+        return (r, g, b)
+
     def analyze_audio(self):
         print(f"[INFO] Analyzing Audio Features...")
-        try:
-            # Standardizing SR to 44.1k to ensure consistent frequency mapping across sources
-            y, sr = librosa.load(self.audio_path, sr=44100, mono=True)
-            self.duration = librosa.get_duration(y=y, sr=sr)
-            self.sample_rate = sr
-            
-            # STFT params: hop_length = 512, n_fft = 2048 (Standard)
-            # This yields frequency bins from 0 to 22.05kHz
-            self.stft = np.abs(librosa.stft(y, hop_length=512, n_fft=2048))
-            
-            # RMS for overall volume pulse (Synced frames to STFT)
-            self.rms_energy = librosa.feature.rms(y=y, hop_length=512)[0]
-            print(f"[SUCCESS] Analysis complete. STFT frames: {self.stft.shape[1]}")
-        except Exception as e:
-            print(f"[ERROR] Audio analysis failed: {e}")
-            raise
-
-    def get_time_index(self, t):
-        if self.stft is None:
-            return 0
-        # Map time t (seconds) to the correct STFT frame index
-        idx = int(t * self.sample_rate / 512)
-        return max(0, min(idx, self.stft.shape[1] - 1))
-
-    def draw_glowing_circle(self, draw, center, radius, color, glow_size=40):
-        # Prevent zero or negative radius crash
-        radius = max(1.0, float(radius))
-        for r in range(int(radius + glow_size), int(radius), -4):
-            # Soft radial glow falloff
-            dist_p = (r - radius) / glow_size
-            alpha = int(45 * (1.0 - dist_p))
-            glow_col = color + (alpha,)
-            draw.ellipse([center[0]-r, center[1]-r, center[0]+r, center[1]+r], fill=glow_col)
-        # Inner solid core
-        draw.ellipse([center[0]-radius, center[1]-radius, center[0]+radius, center[1]+radius], fill=(255, 255, 255, 255))
+        y, sr = librosa.load(self.audio_path, sr=44100, mono=True)
+        self.duration = librosa.get_duration(y=y, sr=sr)
+        self.sample_rate = sr
+        self.stft = np.abs(librosa.stft(y, hop_length=512))
+        self.rms_energy = librosa.feature.rms(y=y, hop_length=512)[0]
 
     def make_frame(self, t):
-        # 1. Create Base Canvas
-        base_img = Image.new('RGBA', (self.width, self.height), (10, 12, 18, 255))
-        draw = ImageDraw.Draw(base_img)
-        center = (self.width // 2, self.height // 2)
+        # 1. Base Setup
+        idx = int(t * self.sample_rate / 512)
+        idx = min(idx, self.stft.shape[1] - 1)
+        
+        # Frequency normalization (Scaling for visuals)
+        stft_max = np.max(self.stft) if self.stft.any() else 1.0
+        bass = np.max(self.stft[1:6, idx]) / (stft_max * 0.7 + 0.1) 
+        bass = min(1.0, bass)
+        
+        rms = self.rms_energy[idx] if self.rms_energy is not None else 0
+        
+        # 2. Timing & Colors
+        travel = self.params['travel_speed']
+        self.offset = (self.offset + (travel + (bass * 70)) * 0.18) % 2000
+        
+        self.color_time = t * self.params['cycle_speed']
+        color_t = (np.sin(self.color_time) + 1) / 2
+        c1 = self.hex_to_rgb(self.params['color_a'])
+        c2 = self.hex_to_rgb(self.params['color_b'])
+        active_color = self.lerp_color(c1, c2, color_t)
+        
+        # 3. Shake Calculation
+        shake_limit = self.params['shake_force']
+        sx = (np.random.random() - 0.5) * (bass**2) * shake_limit
+        sy = (np.random.random() - 0.5) * (bass**2) * shake_limit
+        
+        # 4. Drawing Logic
+        img = Image.new('RGBA', (self.width, self.height), (0, 0, 0, 255))
+        draw = ImageDraw.Draw(img)
+        
+        center = (self.width // 2 + sx, self.height // 2 + sy)
 
-        try:
-            # 2. Extract Frequency/Pulse Data for this timestamp
-            idx = self.get_time_index(t)
+        # Draw Stars
+        star_base = self.params['star_size']
+        for s in self.stars:
+            frame_t = 1/self.fps
+            s['z'] -= ((travel * 0.12 * 60 * frame_t) + (bass * 28 * 60 * frame_t))
+            if s['z'] < 1: s['z'] = self.width
             
-            # RMS Volume Pulse (Drives the central core)
-            rms = self.rms_energy[idx] if self.rms_energy is not None and len(self.rms_energy) > idx else 0
-            vol_pulse = 1.0 + (rms * 2.8) # Adjusted sensitivity
-            base_radius = 160 * vol_pulse
+            s['pulse'] += s['pulse_speed']
+            twinkle = (np.sin(s['pulse']) + 1) / 2
             
-            # 3. Draw Core Glow
-            self.draw_glowing_circle(draw, center, base_radius, self.theme_color)
+            pos_x = center[0] + (s['x'] / s['z']) * (self.width / 2)
+            pos_y = center[1] + (s['y'] / s['z']) * (self.height / 2)
+            
+            nova_boost = (bass * 5) if (s['is_nova'] and bass > 0.8) else 1
+            size = (1 - s['z'] / self.width) * star_base * (0.8 + twinkle * 0.4) * nova_boost
+            
+            if 0 <= pos_x < self.width and 0 <= pos_y < self.height and size > 0.1:
+                alpha = int((1 - s['z'] / self.width) * s['brightness'] * (0.5 + twinkle * 0.5) * 255)
+                draw.ellipse([pos_x - size, pos_y - size, pos_x + size, pos_y + size], 
+                             fill=(255, 255, 255, alpha))
 
-            # 4. Draw Radial Frequency Bars
-            if self.stft is not None:
-                num_bars = 180
-                # Take the lower half of the spectrum (0 - 11kHz) for visually interesting movement
-                stft_segment = self.stft[:512, idx]
-                seg_size = len(stft_segment)
-                
-                for i in range(num_bars):
-                    angle = (i / num_bars) * (2 * np.pi)
-                    
-                    # Logarithmic/Grouped frequency mapping
-                    f_idx = int((i / num_bars) * seg_size)
-                    f_idx = min(f_idx, seg_size - 1)
-                    f_val = stft_segment[f_idx]
-                    
-                    # Higher frequencies don't move as much, so we scale them up for visual fidelity
-                    # bass bars (i < 20) are naturally strong, high ones (i > 100) need boost
-                    boost = 1.0 + (i / num_bars) * 1.5
-                    bar_len = f_val * 400 * boost
-                    
-                    start_r = base_radius + 15
-                    end_r = start_r + bar_len
-                    
-                    x1 = center[0] + start_r * np.cos(angle)
-                    y1 = center[1] + start_r * np.sin(angle)
-                    x2 = center[0] + end_r * np.cos(angle)
-                    y2 = center[1] + end_r * np.sin(angle)
-                    
-                    # Elegant Cyan/Theme gradient bars
-                    draw.line([x1, y1, x2, y2], fill=self.theme_color + (210,), width=3)
-        except Exception as e:
-            # Resilience: Prevent one failed frame from stopping the whole video
-            print(f"[RECOVERABLE ERROR] Frame t={t:.2f} failed: {e}")
+        # Rotate Tunnel
+        self.current_angle += (self.params['rotation_force'] * 0.015 + bass * 0.04)
+        
+        # Tunnel Lines (60fps simulation means we need to draw lines from center)
+        # Note: PIL doesn't support rotation easily for dynamic lines, so we use math
+        for i in range(12):
+            angle = (i / 12) * np.pi * 2 + self.current_angle
+            line_len = 3000
+            lx = center[0] + np.cos(angle) * line_len
+            ly = center[1] + np.sin(angle) * line_len
+            alpha = int((0.3 + bass * 0.4) * 255)
+            draw.line([center[0], center[1], lx, ly], fill=active_color + (alpha,), width=4)
+        
+        # Tunnel Circles
+        for i in range(15):
+            line_z = ((i * 180 - self.offset) % 2000 + 2000) % 2000
+            radius = (2000 / max(1, line_z)) * 120
+            alpha = int(max(0, 1 - (line_z / 2000)) * 255)
+            width = int(max(1, 15 * (1 - line_z / 2000)))
+            
+            draw.ellipse([center[0] - radius, center[1] - radius, center[0] + radius, center[1] + radius], 
+                         outline=active_color + (alpha,), width=width)
 
-        return np.array(base_img.convert('RGB'))
+        # Center Logo & Glow
+        # Radial gradient approximation with multiple circles
+        for r in range(800, 0, -50):
+            alpha = int(max(0, (1 - r/800) * (0.2 + bass * 0.5)) * 255)
+            draw.rectangle([0, 0, self.width, self.height], fill=active_color + (alpha,))
+            # Wait, the HTML does a full screen overlay. Let's do that.
+            break # Just one overlay is enough for performance in PIL
+            
+        # Draw the Logo
+        if self.logo_img:
+            logo_bass_scale = 1 + bass * 0.15
+            target_h = int(self.height * 0.45 * logo_bass_scale)
+            target_w = int(self.logo_img.width * (target_h / self.logo_img.height))
+            
+            logo_resized = self.logo_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            
+            # Simple glow effect (paste copy behind)
+            logo_pos = (self.width // 2 - target_w // 2, self.height // 2 - target_h // 2)
+            img.paste(logo_resized, logo_pos, logo_resized)
+
+        # Watermark
+        if self.mark_img:
+            mw = 270
+            mh = int((self.mark_img.height / self.mark_img.width) * mw)
+            mark_resized = self.mark_img.resize((mw, mh), Image.Resampling.LANCZOS)
+            mark_pos = (self.width - mw - 60, self.height - mh - 60)
+            img.paste(mark_resized, mark_pos, mark_resized)
+
+        return np.array(img.convert('RGB'))
 
     def export(self):
         self.analyze_audio()
-        print(f"[INFO] Exporting @ {self.width}x{self.height} ({self.fps} fps)...")
-        
-        # Clip generation
+        print(f"[INFO] Exporting NEBULA Visualizer...")
         clip = VideoClip(self.make_frame, duration=self.duration)
         audio_clip = AudioFileClip(self.audio_path)
         clip = clip.set_audio(audio_clip)
-        
-        # Render H.264
-        clip.write_videofile(self.output_path, fps=self.fps, codec='libx264', audio_codec='aac', bitrate="8000k")
-        print(f"[SUCCESS] Export Finished: {self.output_path}")
+        clip.write_videofile(self.output_path, fps=self.fps, codec='libx264', audio_codec='aac', bitrate="12000k")
+        print(f"[SUCCESS] Video Saved: {self.output_path}")
 
 if __name__ == "__main__":
     pass
